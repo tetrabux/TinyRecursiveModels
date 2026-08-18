@@ -1,0 +1,33 @@
+name: recursive_reasoning.trm_stochastic@TinyRecursiveReasoningModel_ACTV1
+loss:
+  name: losses@MCLLossHead
+  loss_type: stablemax_cross_entropy
+  mean_weight: 0.1          # small mean-mix on top of winner-take-all (anti-collapse)
+
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+
+H_cycles: 3
+L_cycles: 6
+
+H_layers: 0
+L_layers: 2
+
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+
+pos_encodings: rope        # overridden to `none` on the CLI for the MLP-mixer Sudoku variant
+forward_dtype: bfloat16
+
+mlp_t: False               # overridden to True on the CLI (canonical Sudoku TRM-MLP)
+puzzle_emb_len: 16
+no_ACT_continue: True
+
+# --- A1 stochastic-recursion knobs (future_process.md §4) ---
+n_samples: 4               # N rollouts per puzzle (batch tiled x N internally)
+noise_sigma: 0.1           # additive Gaussian std on z_L each L-cycle
+noise_mode: zL             # "zL" or "both"
+eval_noise: False          # keep deterministic during the in-training eval

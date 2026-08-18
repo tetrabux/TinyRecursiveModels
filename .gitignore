@@ -1,0 +1,14 @@
+# --- Large data & training artifacts (regenerable, not versioned) ---
+# (no trailing slash: these are now symlinks into ../large_artifacts/, and
+# trailing-slash gitignore patterns only match real directories, not symlinks)
+data
+checkpoints
+wandb
+outputs/
+kaggle/
+
+# --- Python cruft ---
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
