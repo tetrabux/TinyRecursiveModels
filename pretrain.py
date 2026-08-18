@@ -5,6 +5,7 @@ import math
 import yaml
 import shutil
 import copy
+import datetime
 
 import torch
 import torch.distributed as dist
@@ -78,6 +79,10 @@ class PretrainConfig(pydantic.BaseModel):
     eval_interval: Optional[int] = None
     min_eval_interval: Optional[int] = 0 # when to start eval
     eval_save_outputs: List[str] = []
+    # Lightweight crash-recovery checkpoint cadence (epochs), independent of eval_interval.
+    # eval_interval (if set) must be a multiple of save_interval. Defaults to eval_interval's
+    # cadence (i.e. no behaviour change) when unset -- only opt in for long unattended runs.
+    save_interval: Optional[int] = None
 
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
@@ -238,7 +243,28 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
         return
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
-    torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
+    final_path = os.path.join(config.checkpoint_path, f"step_{train_state.step}")
+    # Robust save: Lustre torch.save() intermittently raises "File ... cannot be opened".
+    # Write to node-local /tmp first, then copy to the (Lustre) checkpoint dir, retrying a
+    # few times so a single flaky write doesn't kill a ~14h run.
+    import shutil, time
+    state = train_state.model.state_dict()
+    tmp_dir = os.path.join("/tmp", os.environ.get("USER", "trm"), "ckpt_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_path = os.path.join(tmp_dir, f"step_{train_state.step}.tmp")
+    last_err = None
+    for attempt in range(5):
+        try:
+            torch.save(state, tmp_path)
+            shutil.copyfile(tmp_path, final_path + ".partial")
+            os.replace(final_path + ".partial", final_path)  # atomic on same fs
+            os.remove(tmp_path)
+            return
+        except Exception as e:  # noqa: BLE001 - any FS hiccup, retry
+            last_err = e
+            print(f"[save_train_state] attempt {attempt+1}/5 failed: {e}", flush=True)
+            time.sleep(10 * (attempt + 1))
+    print(f"[save_train_state] WARNING: could not persist checkpoint {final_path}: {last_err}", flush=True)
 
 
 def load_checkpoint(model: nn.Module, config: PretrainConfig):
@@ -260,6 +286,68 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
                     torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
                 )
         model.load_state_dict(state_dict, assign=True)
+
+
+def save_resume_state(config: PretrainConfig, train_state: TrainState, ema_helper, next_iter: int):
+    """Full training state for FAITHFUL requeue resume: raw (non-EMA) model weights, optimizer
+    momentum, EMA shadow, step, total_steps and the next outer-iter index. Written atomically to
+    checkpoint_path/resume.pt (Lustre-robust, same retry pattern as save_train_state). Unlike the
+    weights-only step_N file (which holds the EMA/eval weights), this captures everything needed to
+    continue training bit-for-bit: LR position (via step), Adam moments and the EMA shadow."""
+    if config.checkpoint_path is None:
+        return
+    import shutil, time
+    os.makedirs(config.checkpoint_path, exist_ok=True)
+    payload = {
+        "model": train_state.model.state_dict(),
+        "optimizers": [o.state_dict() for o in train_state.optimizers],
+        "step": train_state.step,
+        "total_steps": train_state.total_steps,
+        "next_iter": next_iter,
+        "ema": ema_helper.state_dict() if ema_helper is not None else None,
+    }
+    final_path = os.path.join(config.checkpoint_path, "resume.pt")
+    tmp_dir = os.path.join("/tmp", os.environ.get("USER", "trm"), "ckpt_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_path = os.path.join(tmp_dir, "resume.pt.tmp")
+    last_err = None
+    for attempt in range(5):
+        try:
+            torch.save(payload, tmp_path)
+            shutil.copyfile(tmp_path, final_path + ".partial")
+            os.replace(final_path + ".partial", final_path)  # atomic on same fs
+            os.remove(tmp_path)
+            print(f"[resume] saved full train state @ step {train_state.step}, next_iter {next_iter}", flush=True)
+            return
+        except Exception as e:  # noqa: BLE001 - any FS hiccup, retry
+            last_err = e
+            print(f"[save_resume_state] attempt {attempt+1}/5 failed: {e}", flush=True)
+            time.sleep(10 * (attempt + 1))
+    print(f"[save_resume_state] WARNING: could not persist {final_path}: {last_err}", flush=True)
+
+
+def try_resume(config: PretrainConfig, train_state: TrainState, ema_helper) -> int:
+    """If checkpoint_path/resume.pt exists, restore model + optimizers + step + EMA in place and
+    return the outer-iter index to resume at; else return 0 (fresh start). Auto-detected so a Slurm
+    --requeue just re-runs the same command: first launch is fresh, a requeue resumes. Weights are
+    loaded IN PLACE (assign=False) so the optimizers keep valid references to the live params."""
+    if config.checkpoint_path is None:
+        return 0
+    path = os.path.join(config.checkpoint_path, "resume.pt")
+    if not os.path.exists(path):
+        return 0
+    print(f"[resume] found {path} -> restoring full training state", flush=True)
+    ckpt = torch.load(path, map_location="cuda")
+    train_state.model.load_state_dict(ckpt["model"])          # in-place: keeps optimizer param refs valid
+    for opt, osd in zip(train_state.optimizers, ckpt["optimizers"]):
+        opt.load_state_dict(osd)
+    train_state.step = ckpt["step"]
+    train_state.total_steps = ckpt.get("total_steps", train_state.total_steps)
+    if ema_helper is not None and ckpt.get("ema") is not None:
+        ema_helper.load_state_dict(ckpt["ema"])
+    start_iter = ckpt["next_iter"]
+    print(f"[resume] restored step={train_state.step}, resuming at outer-iter {start_iter}", flush=True)
+    return start_iter
 
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
@@ -541,7 +629,10 @@ def launch(hydra_config: DictConfig):
     # Initialize distributed training if in distributed environment (e.g. torchrun)
     if "LOCAL_RANK" in os.environ:
         # Initialize distributed, default device and dtype
-        dist.init_process_group(backend="nccl")
+        # Default NCCL watchdog timeout is 10 min; a transient Lustre I/O stall on one rank
+        # (dataloading, or another rank still writing a checkpoint) can exceed that and abort
+        # the whole job. Give it more slack -- real hangs still get caught, just later.
+        dist.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=30))
 
         RANK = dist.get_rank()
         WORLD_SIZE = dist.get_world_size()
@@ -561,10 +652,20 @@ def launch(hydra_config: DictConfig):
     torch.random.manual_seed(config.seed + RANK)
 
     # Dataset
-    train_epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
+    # save_interval (if set) drives the training-loop granularity, so we get a cheap resume-only
+    # checkpoint every save_interval epochs; the expensive full eval+checkpoint still only runs
+    # every eval_interval epochs (eval_every_n_iters below).
+    train_epochs_per_iter = config.save_interval if config.save_interval is not None else (
+        config.eval_interval if config.eval_interval is not None else config.epochs)
     total_iters = config.epochs // train_epochs_per_iter
 
-    assert config.epochs % train_epochs_per_iter == 0, "Eval interval must be a divisor of total epochs."
+    assert config.epochs % train_epochs_per_iter == 0, "save/eval interval must be a divisor of total epochs."
+
+    if config.eval_interval is not None:
+        assert config.eval_interval % train_epochs_per_iter == 0, "eval_interval must be a multiple of save_interval."
+        eval_every_n_iters = config.eval_interval // train_epochs_per_iter
+    else:
+        eval_every_n_iters = 1
 
     train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
     try:
@@ -595,9 +696,17 @@ def launch(hydra_config: DictConfig):
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)
 
+    # Faithful requeue resume: if a resume.pt exists in checkpoint_path, restore full state
+    # (model+optimizer+step+EMA) and skip the already-completed outer iters. All ranks read the
+    # same file, so state stays identical across GPUs (grads are all-reduced each step).
+    start_iter = try_resume(config, train_state, ema_helper)
+    if RANK == 0 and progress_bar is not None:
+        progress_bar.update(train_state.step - progress_bar.n)
+
     # Training Loop
-    for _iter_id in range(total_iters):
-        print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
+    for _iter_id in range(start_iter, total_iters):
+        epoch_num = _iter_id * train_epochs_per_iter
+        print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {epoch_num}")
 
         ############ Train Iter
         if RANK == 0:
@@ -612,7 +721,10 @@ def launch(hydra_config: DictConfig):
             if config.ema:
                 ema_helper.update(train_state.model)
 
-        if _iter_id >= config.min_eval_interval:
+        is_last_iter = _iter_id == total_iters - 1
+        do_full_eval = epoch_num >= config.min_eval_interval and ((_iter_id + 1) % eval_every_n_iters == 0 or is_last_iter)
+
+        if do_full_eval:
             ############ Evaluation
             if RANK == 0:
                 print("EVALUATE")
@@ -623,26 +735,32 @@ def launch(hydra_config: DictConfig):
             else:
                 train_state_eval = train_state
             train_state_eval.model.eval()
-            metrics = evaluate(config, 
-                train_state_eval, 
-                eval_loader, 
-                eval_metadata, 
+            metrics = evaluate(config,
+                train_state_eval,
+                eval_loader,
+                eval_metadata,
                 evaluators,
-                rank=RANK, 
+                rank=RANK,
                 world_size=WORLD_SIZE,
                 cpu_group=CPU_PROCESS_GROUP)
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
-                
+
             ############ Checkpointing
             if RANK == 0:
                 print("SAVE CHECKPOINT")
-            if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
+            if RANK == 0 and (config.checkpoint_every_eval or is_last_iter):
                 save_train_state(config, train_state_eval)
+                # full raw state (model+optimizer+step+EMA) for faithful requeue resume
+                save_resume_state(config, train_state, ema_helper, _iter_id + 1)
 
             if config.ema:
                 del train_state_eval
+        elif RANK == 0:
+            # Lightweight crash-recovery save (no eval): keeps resume granularity fine (save_interval)
+            # without paying for a full eval pass every time.
+            save_resume_state(config, train_state, ema_helper, _iter_id + 1)
 
     # finalize
     if dist.is_initialized():
