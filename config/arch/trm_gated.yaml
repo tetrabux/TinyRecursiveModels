@@ -24,5 +24,5 @@ forward_dtype: bfloat16
 mlp_t: False
 puzzle_emb_len: 16
 no_ACT_continue: True
-gate_bias_init: 2.0   # gate starts ~open (sigmoid(2)=0.88) -> early training ~ vanilla TRM
-gate_mode: gate       # "gate" = Idea 3 convex gate; "residual" = ungated param-matched control
+gate_bias_init: 2.0
+gate_mode: gate

@@ -1,27 +1,3 @@
-"""
-A1 — STOCHASTIC-RECURSION TRM (future_process.md §4).
-
-Goal: make branching INTRINSIC. Turn TRM's deterministic fixed-point iteration
-into a stochastic sampler, so repeated rollouts explore different completions of
-the search subtree (the ~31 frozen cells). Paired with the winner-take-all
-multiple-choice-learning loss head (`losses.MCLLossHead`), training pushes at
-least one of N rollouts to be correct; at test time we draw N rollouts and keep
-the one the verifier / the model's own q_halt accepts (no ground truth needed).
-
-This is a faithful copy of `trm.py` (same MLP-mixer / attention block, deep
-supervision, ACT halting, EMA-compatible) with TWO additions:
-  1. Additive Gaussian noise injected into the latent z_L (and optionally z_H)
-     at every L-cycle:  z = net(...) + sigma * eps,  eps ~ N(0, I).  The noise is
-     per-element, so N copies of the same puzzle diverge into N distinct rollouts.
-  2. The ACT wrapper TILES the batch x N and halts/refills PER PUZZLE (all N
-     copies of a puzzle share current_data and a single halt decision), so the N
-     rollouts stay coherent across ACT steps under the 1-step-gradient mechanism.
-
-Reduces EXACTLY to the deterministic baseline when n_samples=1 and noise_sigma=0.
-
-Config knobs (all via config/arch/trm_stochastic.yaml -> arch.__pydantic_extra__):
-  n_samples (N), noise_sigma, noise_mode {"zL","both"}, eval_noise (bool).
-"""
 from typing import Tuple, List, Dict, Optional
 from dataclasses import dataclass
 import math
@@ -61,7 +37,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     H_cycles: int
     L_cycles: int
 
-    H_layers: int  # ignored
+    H_layers: int
     L_layers: int
 
     hidden_size: int
@@ -81,14 +57,12 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     puzzle_emb_len: int = 16
     no_ACT_continue: bool = True
 
-    # --- A1 stochastic-recursion knobs ---
-    n_samples: int = 1            # N rollouts per puzzle (batch is tiled x N internally)
-    noise_sigma: float = 0.0      # std of additive Gaussian noise on z
-    noise_mode: str = "zL"        # "zL" (noise on z_L only) or "both" (z_L and z_H)
-    eval_noise: bool = False      # if True, keep noise active in eval (for best-of-N eval)
+    n_samples: int = 1
+    noise_sigma: float = 0.0
+    noise_mode: str = "zL"
+    eval_noise: bool = False
 
 
-# ---- block / reasoning module: identical to trm.py ----
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
         super().__init__()
@@ -143,11 +117,6 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
         if self.config.puzzle_emb_ndim > 0:
-            # the wrapper tiles each puzzle into N rollouts, so the inner model
-            # processes batch_size * n_samples rows per step -> the sparse-embedding
-            # scratch buffer (local_weights/local_ids) must be sized accordingly.
-            # The sparse optimizer de-duplicates ids (unique + scatter_add), so the
-            # N duplicate ids per puzzle correctly sum their gradients.
             self.puzzle_emb = CastedSparseEmbedding(self.config.num_puzzle_identifiers, self.config.puzzle_emb_ndim,
                                                     batch_size=self.config.batch_size * self.config.n_samples,
                                                     init_std=0, cast_to=self.forward_dtype)
@@ -166,7 +135,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         with torch.no_grad():
             self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)  # type: ignore
+            self.q_head.bias.fill_(-5)
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         embedding = self.embed_tokens(input.to(torch.int32))
@@ -201,19 +170,16 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         seq_info = dict(cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None)
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
-        # noise active in training, or in eval iff eval_noise (for best-of-N eval)
         noise_on = (self.training or self.config.eval_noise)
         noise_zL = noise_on
         noise_zH = noise_on and (self.config.noise_mode == "both")
 
         z_H, z_L = carry.z_H, carry.z_L
-        # H_cycles-1 without grad
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles - 1):
                 for _L_step in range(self.config.L_cycles):
                     z_L = self._noise(self.L_level(z_L, z_H + input_embeddings, **seq_info), noise_zL)
                 z_H = self._noise(self.L_level(z_H, z_L, **seq_info), noise_zH)
-        # 1 with grad
         for _L_step in range(self.config.L_cycles):
             z_L = self._noise(self.L_level(z_L, z_H + input_embeddings, **seq_info), noise_zL)
         z_H = self._noise(self.L_level(z_H, z_L, **seq_info), noise_zH)
@@ -225,8 +191,6 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
 
 class TinyRecursiveReasoningModel_ACTV1(nn.Module):
-    """ACT wrapper with N-rollout tiling + per-puzzle synchronized halting."""
-
     def __init__(self, config_dict: dict):
         super().__init__()
         self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict)
@@ -237,12 +201,9 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         return self.inner.puzzle_emb
 
     def _eff_N(self):
-        """N rollouts when TRAINING; 1 at eval (noise is off there, so the N copies would
-        be identical -> tiling at eval is pure waste; this makes eval ~N x faster)."""
         return self.config.n_samples if self.training else 1
 
     def _tile(self, t):
-        """Repeat each puzzle N times contiguously: puzzle b -> rows [b*N : b*N+N]."""
         N = self._eff_N()
         if N == 1:
             return t
@@ -252,15 +213,13 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         N = self._eff_N()
         bn = batch["inputs"].shape[0] * N
         return TinyRecursiveReasoningModel_ACTV1Carry(
-            inner_carry=self.inner.empty_carry(bn),  # reset on first pass (all halted)
+            inner_carry=self.inner.empty_carry(bn),
             steps=torch.zeros((bn,), dtype=torch.int32),
             halted=torch.ones((bn,), dtype=torch.bool),
             current_data={k: torch.empty((bn, *v.shape[1:]), dtype=v.dtype, device=v.device) for k, v in batch.items()},
         )
 
     def _puzzle_sync(self, flag_bn):
-        """Collapse a [B*N] bool to a per-puzzle decision and broadcast back to [B*N].
-        A puzzle halts when ANY of its N rollouts would halt (keeps copies coherent)."""
         N = self._eff_N()
         if N == 1:
             return flag_bn
@@ -270,7 +229,6 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
     def forward(self, carry, batch):
         tiled_batch = {k: self._tile(v) for k, v in batch.items()}
 
-        # reset halted slots; refill their data identically across the N copies
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
         new_steps = torch.where(carry.halted, 0, carry.steps)
         new_current_data = {k: torch.where(carry.halted.view((-1,) + (1,) * (tiled_batch[k].ndim - 1)), tiled_batch[k], v)
@@ -290,10 +248,8 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                 else:
                     halt_signal = q_halt_logits > q_continue_logits
                 halted = halted | halt_signal
-                # exploration: random min number of steps (per puzzle, broadcast to N)
                 min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
                 halted = halted & (new_steps >= min_halt_steps)
-                # keep the N copies of each puzzle synchronized
                 halted = self._puzzle_sync(halted)
 
                 if not self.config.no_ACT_continue:

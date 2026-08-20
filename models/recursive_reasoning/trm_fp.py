@@ -1,15 +1,3 @@
-"""
-TRM variant with a FIXED-POINT REGULARIZER (improvement experiment, Idea 2a).
-
-Identical to models/recursive_reasoning/trm.py EXCEPT: after the gradient-bearing
-recursion pass produces the final (z_L, z_H), we apply the net one MORE time and
-expose the squared change as outputs["fp_penalty"] = ||z_L_next - z_L||^2 + ||z_H_next - z_H||^2.
-ACTLossHead adds  fixed_point_weight * fp_penalty  to the loss (weight=0 -> no-op).
-
-Motivation (our Phase-4 finding): on FAILED puzzles cell-correctness peaks ~step 6 then
-drifts; solved puzzles reach a stable fixed point fast. This term pushes the recursion
-toward a stable fixed point.
-"""
 from typing import Tuple, List, Dict, Optional
 from dataclasses import dataclass
 import math
@@ -49,7 +37,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     H_cycles: int
     L_cycles: int
 
-    H_layers: int  # ignored
+    H_layers: int
     L_layers: int
 
     hidden_size: int
@@ -68,7 +56,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mlp_t: bool = False
     puzzle_emb_len: int = 16
     no_ACT_continue: bool = True
-    compute_fixed_point: bool = True  # NEW: emit outputs["fp_penalty"] during training
+    compute_fixed_point: bool = True
 
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
@@ -151,7 +139,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         with torch.no_grad():
             self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)  # type: ignore
+            self.q_head.bias.fill_(-5)
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         embedding = self.embed_tokens(input.to(torch.int32))
@@ -187,12 +175,10 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 for _L_step in range(self.config.L_cycles):
                     z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
-        # 1 pass with grad
         for _L_step in range(self.config.L_cycles):
             z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
 
-        # ---- FIXED-POINT PENALTY: one more application; penalize the change ----
         fp_penalty = None
         if self.config.compute_fixed_point and self.training:
             z_L_next = self.L_level(z_L, z_H + input_embeddings, **seq_info)
@@ -207,8 +193,6 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
 
 class TinyRecursiveReasoningModel_ACTV1(nn.Module):
-    """ACT wrapper (with fixed-point penalty passthrough)."""
-
     def __init__(self, config_dict: dict):
         super().__init__()
         self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict)

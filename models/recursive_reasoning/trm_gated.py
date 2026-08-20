@@ -1,23 +1,3 @@
-"""
-TRM variant with GATED STATE UPDATES (improvement experiment, Idea 3).
-
-Identical to models/recursive_reasoning/trm.py EXCEPT every state update is gated,
-GRU/LSTM-style, with a learned per-channel sigmoid gate:
-
-    cand   = L_level(state, context)          # the usual candidate update
-    g      = sigmoid(gate_proj(cand))         # per (position, channel) in [0,1]
-    state  = g * cand + (1 - g) * state       # freeze (g->0) or update (g->1)
-
-The gate is bias-initialised OPEN (bias=+2 -> g~=0.88) so early training behaves
-like vanilla TRM; the model then *learns* to close gates on cells it has settled.
-One shared gate module, reused across z/y updates and recursion steps (TRM's
-weight-reuse philosophy). No extra loss term -> trained by the same CE objective,
-so the gate only closes when closing helps accuracy (this is the key difference
-from Idea 2a, which imposed stability via a competing loss and failed).
-
-Adds ~hidden^2 params (gate_proj). NOT param-matched to TRM-MLP (that's fine for
-an improvement experiment; documented).
-"""
 from typing import Tuple, List, Dict, Optional
 from dataclasses import dataclass
 import math
@@ -57,7 +37,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     H_cycles: int
     L_cycles: int
 
-    H_layers: int  # ignored
+    H_layers: int
     L_layers: int
 
     hidden_size: int
@@ -76,9 +56,8 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mlp_t: bool = False
     puzzle_emb_len: int = 16
     no_ACT_continue: bool = True
-    gate_bias_init: float = 2.0  # NEW: gate starts ~open (sigmoid(2)=0.88)
-    gate_mode: str = "gate"      # "gate" = convex gate (Idea 3); "residual" = ungated extra
-                                 # capacity (param-matched control): state = cand + gate_proj(cand)
+    gate_bias_init: float = 2.0
+    gate_mode: str = "gate"
 
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
@@ -132,7 +111,6 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
 
-        # NEW: shared per-channel gate (GRU-style), reused for z/y updates and across recursion.
         self.gate_proj = CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=True)
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
@@ -155,15 +133,12 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         with torch.no_grad():
             self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)  # type: ignore
-            # gate_proj weight=0 so it starts ~ vanilla TRM.
-            # "gate" mode: bias=+2 -> gate ~open. "residual" mode: bias=0 -> extra term ~0 (identity).
+            self.q_head.bias.fill_(-5)
             self.gate_proj.weight.zero_()
-            self.gate_proj.bias.fill_(0.0 if self.config.gate_mode == "residual" else self.config.gate_bias_init)  # type: ignore
+            self.gate_proj.bias.fill_(0.0 if self.config.gate_mode == "residual" else self.config.gate_bias_init)
 
     def _gate(self, cand: torch.Tensor, old: torch.Tensor) -> torch.Tensor:
         if self.config.gate_mode == "residual":
-            # param-matched control: same gate_proj params, but ungated extra capacity
             return cand + self.gate_proj(cand)
         g = torch.sigmoid(self.gate_proj(cand).to(torch.float32)).to(cand.dtype)
         return g * cand + (1.0 - g) * old
@@ -202,7 +177,6 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 for _L_step in range(self.config.L_cycles):
                     z_L = self._gate(self.L_level(z_L, z_H + input_embeddings, **seq_info), z_L)
                 z_H = self._gate(self.L_level(z_H, z_L, **seq_info), z_H)
-        # 1 pass with grad
         for _L_step in range(self.config.L_cycles):
             z_L = self._gate(self.L_level(z_L, z_H + input_embeddings, **seq_info), z_L)
         z_H = self._gate(self.L_level(z_H, z_L, **seq_info), z_H)
@@ -214,8 +188,6 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
 
 class TinyRecursiveReasoningModel_ACTV1(nn.Module):
-    """ACT wrapper (gated variant)."""
-
     def __init__(self, config_dict: dict):
         super().__init__()
         self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict)

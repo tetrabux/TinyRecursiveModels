@@ -2,7 +2,7 @@ name: recursive_reasoning.trm_fp@TinyRecursiveReasoningModel_ACTV1
 loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy
-  fixed_point_weight: 0.5   # Idea 2a strength; override via arch.loss.fixed_point_weight=...
+  fixed_point_weight: 0.5
 
 halt_exploration_prob: 0.1
 halt_max_steps: 16

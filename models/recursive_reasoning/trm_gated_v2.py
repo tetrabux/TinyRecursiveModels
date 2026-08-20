@@ -1,26 +1,3 @@
-"""
-TRM variant A1 — PROPER DECOUPLED GRU GATE (improvement experiment).
-
-Upgrades the Idea-3 gate (trm_gated.py) on two axes that M1 gate-inspection
-(2026-06-16) flagged as flaws of the original:
-  (1) the original gate saw only the CANDIDATE: g = sigmoid(W . cand);
-  (2) one SHARED gate was used for both the z_L (scratchpad) and z_H (answer)
-      updates, which have opposite needs.
-Here the gate is a textbook GRU update gate that sees BOTH the candidate and the
-old state, and z_L / z_H get SEPARATE gates:
-
-    cand = L_level(state, context)
-    g    = sigmoid(proj([cand ; old]))        # proj is gate_proj_L or gate_proj_H
-    state= g * cand + (1 - g) * old           # freeze (g->0) or update (g->1)
-
-Gates bias-initialised OPEN (bias=+2 -> g~=0.88) with zero weight, so early
-training behaves like vanilla TRM. No extra loss term -> the CE objective decides
-when closing helps (the key difference from Idea 2a). Motivation: the old gate was
-shown to freeze WRONG cells more than correct ones (locking in mistakes); seeing
-`old` and decoupling z_L/z_H should let it stop doing that.
-
-Adds ~2 * (2*hidden*hidden) params (two gate_projs). NOT param-matched (documented).
-"""
 from typing import Tuple, List, Dict, Optional
 from dataclasses import dataclass
 import math
@@ -60,7 +37,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     H_cycles: int
     L_cycles: int
 
-    H_layers: int  # ignored
+    H_layers: int
     L_layers: int
 
     hidden_size: int
@@ -79,9 +56,8 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mlp_t: bool = False
     puzzle_emb_len: int = 16
     no_ACT_continue: bool = True
-    gate_bias_init: float = 2.0  # NEW: gate starts ~open (sigmoid(2)=0.88)
-    gate_mode: str = "gate"      # "gate" = convex gate (Idea 3); "residual" = ungated extra
-                                 # capacity (param-matched control): state = cand + gate_proj(cand)
+    gate_bias_init: float = 2.0
+    gate_mode: str = "gate"
 
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
@@ -135,7 +111,6 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
 
-        # A1: SEPARATE GRU update gates for z_L and z_H, each seeing [cand ; old] (2*hidden in).
         self.gate_proj_L = CastedLinear(2 * self.config.hidden_size, self.config.hidden_size, bias=True)
         self.gate_proj_H = CastedLinear(2 * self.config.hidden_size, self.config.hidden_size, bias=True)
 
@@ -159,11 +134,10 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         with torch.no_grad():
             self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)  # type: ignore
-            # zero weight + bias=+2 -> g~=0.88 (gates start ~open) so init ~ vanilla TRM.
+            self.q_head.bias.fill_(-5)
             for proj in (self.gate_proj_L, self.gate_proj_H):
                 proj.weight.zero_()
-                proj.bias.fill_(self.config.gate_bias_init)  # type: ignore
+                proj.bias.fill_(self.config.gate_bias_init)
 
     def _gate(self, cand: torch.Tensor, old: torch.Tensor, proj: nn.Module) -> torch.Tensor:
         g = torch.sigmoid(proj(torch.cat((cand, old), dim=-1)).to(torch.float32)).to(cand.dtype)
@@ -203,7 +177,6 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 for _L_step in range(self.config.L_cycles):
                     z_L = self._gate(self.L_level(z_L, z_H + input_embeddings, **seq_info), z_L, self.gate_proj_L)
                 z_H = self._gate(self.L_level(z_H, z_L, **seq_info), z_H, self.gate_proj_H)
-        # 1 pass with grad
         for _L_step in range(self.config.L_cycles):
             z_L = self._gate(self.L_level(z_L, z_H + input_embeddings, **seq_info), z_L, self.gate_proj_L)
         z_H = self._gate(self.L_level(z_H, z_L, **seq_info), z_H, self.gate_proj_H)
@@ -215,8 +188,6 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
 
 class TinyRecursiveReasoningModel_ACTV1(nn.Module):
-    """ACT wrapper (gated variant)."""
-
     def __init__(self, config_dict: dict):
         super().__init__()
         self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict)

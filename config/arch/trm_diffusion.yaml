@@ -4,10 +4,10 @@ loss:
   loss_type: stablemax_cross_entropy
 
 halt_exploration_prob: 0.0
-halt_max_steps: 16          # = number of denoising steps in the unroll
+halt_max_steps: 16
 
 H_cycles: 3
-L_cycles: 4                 # maze recipe (matches the maze baseline / 16x4)
+L_cycles: 4
 
 H_layers: 0
 L_layers: 2
@@ -18,16 +18,15 @@ expansion: 4
 
 puzzle_emb_ndim: ${.hidden_size}
 
-pos_encodings: rope         # maze = TRM-Att (attention + rope)
+pos_encodings: rope
 forward_dtype: bfloat16
 
 mlp_t: False
 puzzle_emb_len: 16
 no_ACT_continue: True
 
-# --- Approach C (masked diffusion) ---
-task: maze                  # selects build_input_maze + the maze unknown token
+task: maze
 mask_schedule_kind: cosine
-corrupt_rate: 0.1           # wrong-value corruption (anti-freeze training, T20)
-base_loss_weight: 0.1       # weight on revealed-correct cells (vs 1.0 on masked+corrupt)
-n_infer_steps: 0            # 0 -> use halt_max_steps refinement steps at test
+corrupt_rate: 0.1
+base_loss_weight: 0.1
+n_infer_steps: 0

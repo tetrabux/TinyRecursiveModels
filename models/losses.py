@@ -44,8 +44,6 @@ class ACTLossHead(nn.Module):
         self.model = model
         self.loss_fn = globals()[loss_type]
         self.fixed_point_weight = fixed_point_weight
-        # L3: focal / hard-cell weighting. >0 upweights cells the model is unsure of
-        # (weight = (1 - p_true)^gamma, per-puzzle renormalised so loss scale is preserved).
         self.focal_gamma = focal_gamma
         
     def initial_carry(self, *args, **kwargs):
@@ -90,9 +88,6 @@ class ACTLossHead(nn.Module):
 
         lm_cells = self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask)
         if self.focal_gamma > 0:
-            # weight each valid cell by (1 - p_true)^gamma (detached -> pure reweighting),
-            # renormalised per puzzle so the total loss scale stays ~unchanged (isolates the
-            # reweighting effect from a global effective-LR change).
             with torch.no_grad():
                 p = torch.softmax(outputs["logits"].to(torch.float32), dim=-1)
                 idx = torch.where(mask, labels, 0).to(torch.long).unsqueeze(-1)
@@ -114,8 +109,6 @@ class ACTLossHead(nn.Module):
             metrics["q_continue_loss"] = q_continue_loss.detach()
 
         total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
-        # Fixed-point regularizer (Idea 2a): fp_penalty is a per-batch MEAN; scale to
-        # batch-sum so its weight is comparable to lm_loss (also a sum, /gbs at backward).
         fp_penalty = outputs.get("fp_penalty", None)
         if fp_penalty is not None and self.fixed_point_weight > 0:
             bsz = outputs["logits"].shape[0]
@@ -129,18 +122,6 @@ class ACTLossHead(nn.Module):
 
 
 class DiffusionLossHead(nn.Module):
-    """Approach C — masked-diffusion loss head (future_process.md §5).
-
-    TRAIN: 16-step denoising unroll. Each step k builds the teacher-forced board y_k
-    (reveal_frac = 1 - mask_schedule[k] + wrong-value corruption), runs one recursion pass
-    with the per-step mask-level embedding, accumulates weighted CE (heavy on masked+corrupt
-    cells) + qhalt BCE, detaching z between steps.
-
-    EVAL: runs the SIMPLE greedy confidence-based MaskGIT sampler (start all-unknown, each
-    step commit the highest-confidence answer cells up to the schedule's reveal target,
-    re-mask the rest) and reports REAL exact-match. (Stochastic/temperature re-masking is the
-    documented fallback — see KT §14 / future_process.md §5.4.)
-    """
     def __init__(self, model: nn.Module, loss_type: str = "stablemax_cross_entropy"):
         super().__init__()
         self.model = model
@@ -158,7 +139,7 @@ class DiffusionLossHead(nn.Module):
         self.n_infer = c.n_infer_steps or c.halt_max_steps
 
     def initial_carry(self, *a, **k):
-        return None   # diffusion drives its own loop; the ACT carry is unused
+        return None
 
     def _answer_mask(self, inputs):
         return (inputs == self._MAZE_OPEN) if self.task == "maze" else (inputs == self._BLANK)
@@ -180,7 +161,6 @@ class DiffusionLossHead(nn.Module):
         with torch.no_grad():
             return self._sample(batch, return_keys)
 
-    # ----------------------------------------------------------------- training unroll
     def _train(self, batch, return_keys):
         from models.diffusion_utils import mask_schedule
         inputs, labels = batch["inputs"], batch["labels"]
@@ -200,12 +180,12 @@ class DiffusionLossHead(nn.Module):
             reveal = 1.0 - sched[k].item()
             y_k, w_k = self._build(inputs, labels, reveal, order)
             z, logits, q = self.model.denoise_step(z[0], z[1], y_k, pe, k)
-            ce = self.loss_fn(logits, labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask)   # [B,L]
+            ce = self.loss_fn(logits, labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask)
             weight = (w_k + self.base_w * (1.0 - w_k)) * mask
-            lm_k = (ce * weight).sum(-1) / weight.sum(-1).clamp_min(1e-6)                       # [B]
+            lm_k = (ce * weight).sum(-1) / weight.sum(-1).clamp_min(1e-6)
             with torch.no_grad():
-                seq_ok = ((logits.argmax(-1) == labels) | ~mask).all(-1).to(q.dtype)           # [B]
-            q_k = F.binary_cross_entropy_with_logits(q, seq_ok, reduction="none")              # [B]
+                seq_ok = ((logits.argmax(-1) == labels) | ~mask).all(-1).to(q.dtype)
+            q_k = F.binary_cross_entropy_with_logits(q, seq_ok, reduction="none")
             total = total + lm_k.sum() + 0.5 * q_k.sum()
             z = (z[0].detach(), z[1].detach())
             last_logits, last_q = logits, q
@@ -224,7 +204,6 @@ class DiffusionLossHead(nn.Module):
             }
         return None, total, metrics, {}, True
 
-    # ----------------------------------------------------------------- greedy MaskGIT sampler (eval)
     def _sample(self, batch, return_keys):
         from models.diffusion_utils import mask_schedule
         inputs, labels = batch["inputs"], batch["labels"]
@@ -236,10 +215,10 @@ class DiffusionLossHead(nn.Module):
         pe = self.model.embed_puzzle(pids)
         z = self.model.initial_z(B, dev)
         ans = self._answer_mask(inputs)
-        n_ans = ans.sum(-1).to(torch.float32)                       # [B]
+        n_ans = ans.sum(-1).to(torch.float32)
         UNK = self._MAZE_UNKNOWN if self.task == "maze" else self._BLANK
         valid = self._valid_tokens()
-        grid = torch.where(ans, torch.full_like(inputs, UNK), inputs)   # start: answer cells unknown
+        grid = torch.where(ans, torch.full_like(inputs, UNK), inputs)
         last_q = None
         last_logits = None
         for k in range(n):
@@ -249,10 +228,10 @@ class DiffusionLossHead(nn.Module):
             for t in valid:
                 vlog[..., t] = logits[..., t].float()
             probs = torch.softmax(vlog, dim=-1)
-            conf, pred = probs.max(-1)                              # [B,L]
+            conf, pred = probs.max(-1)
             conf = torch.where(ans, conf, torch.full_like(conf, -1.0))
-            target = ((1.0 - sched[k]) * n_ans).round().long()     # [B] cumulative reveal
-            rank = conf.argsort(-1, descending=True).argsort(-1)   # [B,L] 0=most confident
+            target = ((1.0 - sched[k]) * n_ans).round().long()
+            rank = conf.argsort(-1, descending=True).argsort(-1)
             commit = ans & (rank < target.unsqueeze(-1))
             grid = torch.where(commit, pred, torch.where(ans, torch.full_like(grid, UNK), grid))
 
@@ -274,42 +253,24 @@ class DiffusionLossHead(nn.Module):
 
 
 class MCLLossHead(nn.Module):
-    """A1 — Multiple-Choice-Learning / Winner-Take-All loss for the stochastic
-    recursion model (future_process.md §4.2).
-
-    The stochastic ACT wrapper tiles each puzzle into N rollouts (contiguous:
-    puzzle b -> rows [b*N : b*N+N]). Here we:
-      * backprop ONLY the best (min-CE) rollout per puzzle (winner-take-all), so
-        diverse modes are encouraged and at least one rollout is pushed correct;
-      * add a small weight on the MEAN rollout loss to mitigate mode collapse
-        (the documented `mean_weight` mitigation);
-      * train each rollout's q_halt head to predict ITS OWN correctness (per
-        rollout), so test-time selection by q_halt works.
-    Loss scale matches ACTLossHead (sum over B puzzles; train_batch divides by
-    global_batch_size = B), so it is directly comparable to the baseline.
-
-    Reduces to the plain per-puzzle loss when n_samples == 1.
-    """
     def __init__(self, model: nn.Module, loss_type: str, mean_weight: float = 0.1):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
-        self.mean_weight = mean_weight  # small mean-mix to avoid WTA mode collapse
+        self.mean_weight = mean_weight
 
     @property
     def N(self):
-        # the wrapper tiles xN only in training; at eval it runs N=1 (noise off), so the
-        # batch is un-tiled and we must group by 1 to match.
         return self.model.config.n_samples if self.model.training else 1
 
     def initial_carry(self, *args, **kwargs):
-        return self.model.initial_carry(*args, **kwargs)  # type: ignore
+        return self.model.initial_carry(*args, **kwargs)
 
     def forward(self, return_keys: Sequence[str], **model_kwargs):
         new_carry, outputs = self.model(**model_kwargs)
-        labels = new_carry.current_data["labels"]          # [B*N, L]
-        logits = outputs["logits"]                         # [B*N, L, V]
-        q_halt = outputs["q_halt_logits"]                  # [B*N]
+        labels = new_carry.current_data["labels"]
+        logits = outputs["logits"]
+        q_halt = outputs["q_halt_logits"]
         N = self.N
         BN = labels.shape[0]
         assert BN % N == 0, f"batch {BN} not divisible by n_samples {N}"
@@ -318,16 +279,16 @@ class MCLLossHead(nn.Module):
         with torch.no_grad():
             outputs["preds"] = torch.argmax(logits, dim=-1)
             mask = (labels != IGNORE_LABEL_ID)
-            loss_counts = mask.sum(-1)                      # [B*N]
-            seq_is_correct = (mask & (outputs["preds"] == labels)).sum(-1) == loss_counts  # [B*N]
+            loss_counts = mask.sum(-1)
+            seq_is_correct = (mask & (outputs["preds"] == labels)).sum(-1) == loss_counts
 
-            halted_p = new_carry.halted.view(B, N)[:, 0]    # synced across N -> take rollout 0
-            valid_p = halted_p & (loss_counts.view(B, N)[:, 0] > 0)             # [B]
+            halted_p = new_carry.halted.view(B, N)[:, 0]
+            valid_p = halted_p & (loss_counts.view(B, N)[:, 0] > 0)
             sc_view = seq_is_correct.view(B, N)
-            best_of_N = sc_view.any(dim=1)                  # [B] any rollout solved the puzzle
-            cell_frac = (mask & (outputs["preds"] == labels)).sum(-1).float() / loss_counts.clamp_min(1)  # [B*N]
-            best_cell = cell_frac.view(B, N).max(dim=1).values                  # [B]
-            qh_correct = ((q_halt >= 0) == seq_is_correct).view(B, N).float().mean(dim=1)  # [B]
+            best_of_N = sc_view.any(dim=1)
+            cell_frac = (mask & (outputs["preds"] == labels)).sum(-1).float() / loss_counts.clamp_min(1)
+            best_cell = cell_frac.view(B, N).max(dim=1).values
+            qh_correct = ((q_halt >= 0) == seq_is_correct).view(B, N).float().mean(dim=1)
             metrics = {
                 "count": valid_p.sum(),
                 "accuracy": torch.where(valid_p, best_cell, 0).sum(),
@@ -336,13 +297,11 @@ class MCLLossHead(nn.Module):
                 "steps": torch.where(valid_p, new_carry.steps.view(B, N)[:, 0], 0).sum(),
             }
 
-        # per-rollout LM loss, then winner-take-all + small mean-mix over the N rollouts
         divisor = loss_counts.clamp_min(1).unsqueeze(-1)
-        lm_cells = self.loss_fn(logits, labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask)  # [B*N, L]
-        per_rollout = (lm_cells / divisor).sum(-1).view(B, N)                   # [B, N]
+        lm_cells = self.loss_fn(logits, labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask)
+        per_rollout = (lm_cells / divisor).sum(-1).view(B, N)
         lm_loss = per_rollout.min(dim=1).values.sum() + self.mean_weight * per_rollout.mean(dim=1).sum()
 
-        # each rollout's halt head predicts its own correctness; /N keeps per-puzzle scale
         q_halt_loss = F.binary_cross_entropy_with_logits(
             q_halt, seq_is_correct.to(q_halt.dtype), reduction="sum") / N
 
