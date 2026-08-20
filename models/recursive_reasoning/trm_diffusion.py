@@ -113,12 +113,13 @@ class TinyRecursiveReasoningModel_Diffusion(nn.Module):
         if puzzle_embedding is not None:
             emb = torch.cat((puzzle_embedding, emb), dim=-2)
         k = torch.as_tensor(step_idx, device=grid.device, dtype=torch.int32)
-        emb = emb + self.step_emb(k).view(1, 1, -1)
+        emb = emb + self.step_emb(k).view(1, 1, -1)  # tells the net how revealed the board is
         if self.config.pos_encodings == "learned":
             emb = 0.707106781 * (emb + self.embed_pos.embedding_weight.to(self.forward_dtype))
         return self.embed_scale * emb
 
     def denoise_step(self, z_H, z_L, grid, puzzle_embedding, step_idx: int):
+        # one pass over the board as it currently stands
         seq_info = dict(cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None)
         input_emb = self._input_embeddings(grid, puzzle_embedding, step_idx)
 

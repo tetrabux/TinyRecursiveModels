@@ -30,7 +30,7 @@ def build_input(inputs: torch.Tensor, labels: torch.Tensor, reveal_frac: float,
     revealed = answer & (rank < reveal_count)
 
     r = torch.rand(B, L, generator=generator, device=dev)
-    corrupt = revealed & (r < corrupt_rate)
+    corrupt = revealed & (r < corrupt_rate)  # wrong on purpose, teaches revision
 
     y = torch.where(answer, torch.full_like(inputs, BLANK_TOKEN), inputs)
     y = torch.where(revealed, labels, y)

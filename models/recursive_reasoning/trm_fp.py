@@ -181,6 +181,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         fp_penalty = None
         if self.config.compute_fixed_point and self.training:
+            # one extra pass, penalize how much it still moves
             z_L_next = self.L_level(z_L, z_H + input_embeddings, **seq_info)
             z_H_next = self.L_level(z_H, z_L_next, **seq_info)
             fp_penalty = ((z_L_next - z_L).float().pow(2).mean()

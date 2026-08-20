@@ -88,6 +88,7 @@ class ACTLossHead(nn.Module):
 
         lm_cells = self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask)
         if self.focal_gamma > 0:
+            # weigh the cells the model is unsure of more
             with torch.no_grad():
                 p = torch.softmax(outputs["logits"].to(torch.float32), dim=-1)
                 idx = torch.where(mask, labels, 0).to(torch.long).unsqueeze(-1)
@@ -109,7 +110,7 @@ class ACTLossHead(nn.Module):
             metrics["q_continue_loss"] = q_continue_loss.detach()
 
         total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
-        fp_penalty = outputs.get("fp_penalty", None)
+        fp_penalty = outputs.get("fp_penalty", None)  # only set by the fixed-point variant
         if fp_penalty is not None and self.fixed_point_weight > 0:
             bsz = outputs["logits"].shape[0]
             total_loss = total_loss + self.fixed_point_weight * fp_penalty * bsz
@@ -300,6 +301,7 @@ class MCLLossHead(nn.Module):
         divisor = loss_counts.clamp_min(1).unsqueeze(-1)
         lm_cells = self.loss_fn(logits, labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask)
         per_rollout = (lm_cells / divisor).sum(-1).view(B, N)
+        # backprop the best rollout, small nudge from the rest
         lm_loss = per_rollout.min(dim=1).values.sum() + self.mean_weight * per_rollout.mean(dim=1).sum()
 
         q_halt_loss = F.binary_cross_entropy_with_logits(

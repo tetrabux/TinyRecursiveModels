@@ -57,6 +57,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     puzzle_emb_len: int = 16
     no_ACT_continue: bool = True
 
+    # stochastic recursion knobs
     n_samples: int = 1
     noise_sigma: float = 0.0
     noise_mode: str = "zL"
@@ -162,6 +163,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         )
 
     def _noise(self, z, active):
+        # this is what turns recursion into a sampler
         if active and self.config.noise_sigma > 0:
             return z + self.config.noise_sigma * torch.randn_like(z)
         return z
@@ -204,6 +206,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         return self.config.n_samples if self.training else 1
 
     def _tile(self, t):
+        # duplicate each puzzle N times in a row
         N = self._eff_N()
         if N == 1:
             return t
@@ -220,6 +223,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         )
 
     def _puzzle_sync(self, flag_bn):
+        # keep a puzzle's N rollouts halting together
         N = self._eff_N()
         if N == 1:
             return flag_bn

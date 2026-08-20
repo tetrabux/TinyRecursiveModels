@@ -56,7 +56,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mlp_t: bool = False
     puzzle_emb_len: int = 16
     no_ACT_continue: bool = True
-    gate_bias_init: float = 2.0
+    gate_bias_init: float = 2.0  # gate starts mostly open
     gate_mode: str = "gate"
 
 
@@ -138,6 +138,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             self.gate_proj.bias.fill_(0.0 if self.config.gate_mode == "residual" else self.config.gate_bias_init)
 
     def _gate(self, cand: torch.Tensor, old: torch.Tensor) -> torch.Tensor:
+        # residual mode is the ungated control run
         if self.config.gate_mode == "residual":
             return cand + self.gate_proj(cand)
         g = torch.sigmoid(self.gate_proj(cand).to(torch.float32)).to(cand.dtype)

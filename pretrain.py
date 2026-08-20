@@ -79,7 +79,7 @@ class PretrainConfig(pydantic.BaseModel):
     eval_interval: Optional[int] = None
     min_eval_interval: Optional[int] = 0 # when to start eval
     eval_save_outputs: List[str] = []
-    save_interval: Optional[int] = None
+    save_interval: Optional[int] = None  # cheap checkpoint, no eval needed
 
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
@@ -241,6 +241,7 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
     final_path = os.path.join(config.checkpoint_path, f"step_{train_state.step}")
+    # writes to /tmp first, retries on flaky cluster storage
     import shutil, time
     state = train_state.model.state_dict()
     tmp_dir = os.path.join("/tmp", os.environ.get("USER", "trm"), "ckpt_tmp")
@@ -283,6 +284,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
 
 
 def save_resume_state(config: PretrainConfig, train_state: TrainState, ema_helper, next_iter: int):
+    # everything needed to pick training back up mid-run
     if config.checkpoint_path is None:
         return
     import shutil, time
@@ -316,6 +318,7 @@ def save_resume_state(config: PretrainConfig, train_state: TrainState, ema_helpe
 
 
 def try_resume(config: PretrainConfig, train_state: TrainState, ema_helper) -> int:
+    # picks up automatically after a Slurm requeue
     if config.checkpoint_path is None:
         return 0
     path = os.path.join(config.checkpoint_path, "resume.pt")
@@ -614,7 +617,7 @@ def launch(hydra_config: DictConfig):
     # Initialize distributed training if in distributed environment (e.g. torchrun)
     if "LOCAL_RANK" in os.environ:
         # Initialize distributed, default device and dtype
-        dist.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=30))
+        dist.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=30))  # default 10 min is too tight
 
         RANK = dist.get_rank()
         WORLD_SIZE = dist.get_world_size()
@@ -634,6 +637,7 @@ def launch(hydra_config: DictConfig):
     torch.random.manual_seed(config.seed + RANK)
 
     # Dataset
+    # save more often than we eval, if asked to
     train_epochs_per_iter = config.save_interval if config.save_interval is not None else (
         config.eval_interval if config.eval_interval is not None else config.epochs)
     total_iters = config.epochs // train_epochs_per_iter
@@ -675,7 +679,7 @@ def launch(hydra_config: DictConfig):
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)
 
-    start_iter = try_resume(config, train_state, ema_helper)
+    start_iter = try_resume(config, train_state, ema_helper)  # 0 unless a resume.pt exists
     if RANK == 0 and progress_bar is not None:
         progress_bar.update(train_state.step - progress_bar.n)
 
@@ -733,6 +737,7 @@ def launch(hydra_config: DictConfig):
             if config.ema:
                 del train_state_eval
         elif RANK == 0:
+            # no eval this iter, just checkpoint for resume
             save_resume_state(config, train_state, ema_helper, _iter_id + 1)
 
     # finalize

@@ -19,10 +19,10 @@ expansion: 4
 
 puzzle_emb_ndim: ${.hidden_size}
 
-pos_encodings: rope
+pos_encodings: rope  # sudoku run overrides this to none
 forward_dtype: bfloat16
 
-mlp_t: False
+mlp_t: False  # sudoku run overrides this to true
 puzzle_emb_len: 16
 no_ACT_continue: True
 

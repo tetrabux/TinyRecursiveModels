@@ -111,6 +111,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
 
+        # separate gates for z_L and z_H, not shared
         self.gate_proj_L = CastedLinear(2 * self.config.hidden_size, self.config.hidden_size, bias=True)
         self.gate_proj_H = CastedLinear(2 * self.config.hidden_size, self.config.hidden_size, bias=True)
 
@@ -140,6 +141,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 proj.bias.fill_(self.config.gate_bias_init)
 
     def _gate(self, cand: torch.Tensor, old: torch.Tensor, proj: nn.Module) -> torch.Tensor:
+        # gate sees both old state and candidate now
         g = torch.sigmoid(proj(torch.cat((cand, old), dim=-1)).to(torch.float32)).to(cand.dtype)
         return g * cand + (1.0 - g) * old
 

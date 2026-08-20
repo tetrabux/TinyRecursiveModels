@@ -29,4 +29,4 @@ task: maze
 mask_schedule_kind: cosine
 corrupt_rate: 0.1
 base_loss_weight: 0.1
-n_infer_steps: 0
+n_infer_steps: 0  # 0 means use halt_max_steps
