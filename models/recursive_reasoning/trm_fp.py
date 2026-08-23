@@ -1,3 +1,11 @@
+# This file started as a copy of models/recursive_reasoning/trm.py.
+# Most of the code below is theirs, and I kept it as it was.
+# What I added: running the recursion towards a fixed point and reporting the
+# residual, controlled by compute_fixed_point.
+#
+# Upstream project: SamsungSAILMontreal/TinyRecursiveModels, MIT licence.
+# Copyright (c) 2025 Samsung Electronics Co., Ltd.
+
 from typing import Tuple, List, Dict, Optional
 from dataclasses import dataclass
 import math

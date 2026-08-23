@@ -1,3 +1,6 @@
+# I wrote this file. It has no upstream counterpart.
+# It holds the masking schedule and token helpers for the diffusion variant.
+
 import torch
 
 PAD_TOKEN = 0

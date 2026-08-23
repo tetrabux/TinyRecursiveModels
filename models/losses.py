@@ -1,3 +1,10 @@
+# This is an upstream file that I edited rather than rewrote.
+# What I added: DiffusionLossHead and MCLLossHead, plus the fixed point and
+# focal options on the existing loss head. Everything else is upstream.
+#
+# Upstream project: SamsungSAILMontreal/TinyRecursiveModels, MIT licence.
+# Copyright (c) 2025 Samsung Electronics Co., Ltd.
+
 from typing import Any, Tuple, Dict, Sequence, Optional
 
 import torch

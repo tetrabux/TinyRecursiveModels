@@ -1,3 +1,11 @@
+# This file borrows the block and reasoning module from trm_stochastic.py, which
+# in turn came from models/recursive_reasoning/trm.py.
+# What I wrote: the masked denoising loop that replaces the halting loop.
+# Less of this file is upstream code than the other variants here.
+#
+# Upstream project: SamsungSAILMontreal/TinyRecursiveModels, MIT licence.
+# Copyright (c) 2025 Samsung Electronics Co., Ltd.
+
 from typing import List, Dict, Tuple
 import math
 import torch

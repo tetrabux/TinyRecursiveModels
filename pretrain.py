@@ -1,3 +1,10 @@
+# This is an upstream file that I edited rather than rewrote.
+# What I added: save_resume_state and try_resume, so a run can pick up again
+# after the cluster kills it. Everything else is upstream.
+#
+# Upstream project: SamsungSAILMontreal/TinyRecursiveModels, MIT licence.
+# Copyright (c) 2025 Samsung Electronics Co., Ltd.
+
 from typing import Optional, Any, Sequence, List
 from dataclasses import dataclass
 import os

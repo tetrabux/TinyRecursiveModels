@@ -1,3 +1,11 @@
+# This file started as a copy of models/recursive_reasoning/trm.py.
+# Most of the code below is theirs, and I kept it as it was.
+# What I added: the same gating idea as trm_gated.py, but with a separate gate
+# for z_L and z_H, and the gate now sees the old state as well as the candidate.
+#
+# Upstream project: SamsungSAILMontreal/TinyRecursiveModels, MIT licence.
+# Copyright (c) 2025 Samsung Electronics Co., Ltd.
+
 from typing import Tuple, List, Dict, Optional
 from dataclasses import dataclass
 import math
